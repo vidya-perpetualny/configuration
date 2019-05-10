@@ -11,9 +11,10 @@ RUN curl -sL https://deb.nodesource.com/setup_8.x | sudo -E bash - && \
     apt-get update && apt-get install -y nodejs
 
 # Install php
-RUN apt-get update && apt-get install -y \
-    php5-common \
-    php5-cli
+RUN add-apt-repository -y ppa:ondrej/php && \
+    apt-get update && apt-get install -y \
+    php5.6-common \
+    php5.6-cli
 
 # Install drush (drupal shell) for access to Drupal commands/Acquia
 RUN php -r "readfile('http://files.drush.org/drush.phar');" > drush && \

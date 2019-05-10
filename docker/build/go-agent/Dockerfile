@@ -1,6 +1,6 @@
 # To run, use the command docker build . -f docker/build/go-agent/Dockerfile --tag edx-ops/go-agent:latest
-# https://hub.docker.com/r/gocd/gocd-agent-ubuntu-14.04/
-FROM gocd/gocd-agent-ubuntu-14.04:v17.10.0
+# https://hub.docker.com/r/gocd/gocd-agent-ubuntu-18.04/
+FROM gocd/gocd-agent-ubuntu-18.04:v19.3.0
 
 LABEL version="0.02" \
       description="This custom go-agent docker file installs additional requirements for the edx pipeline"
@@ -13,16 +13,22 @@ ENV LANG en_US.UTF-8
 ENV LANGUAGE en_US:en
 ENV LC_ALL en_US.UTF-8
 
+# setup timezone
+ENV TZ=Etc/UTC
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
 # starting with 16.04 apt-get-repository is not installed in the base image, lets install it so we are ready
 # http://lifeonubuntu.com/ubuntu-missing-add-apt-repository-command/
 RUN apt-get update && apt-get install -y -q \
-    software-properties-common \
-    python-software-properties
+    software-properties-common
 
 # Install a modern git client
 RUN add-apt-repository -y ppa:git-core/ppa && \
     apt-get update && \
     apt-get -y install git
+
+# Install ca-certificates-java to update the ca-certs used for java runtimes
+RUN apt-get update && apt-get install ca-certificates-java -y
 
 # Configure ca-certificates for java
 RUN /var/lib/dpkg/info/ca-certificates-java.postinst configure
@@ -50,6 +56,9 @@ RUN /bin/bash /tmp/docker/docker_install.sh
 # See: https://docs.docker.com/engine/installation/linux/ubuntulinux/
 RUN usermod -aG docker go
 
+# Install sudo to execute commands with root privileges
+RUN apt-get install -y sudo
+
 # Assign the go user root privlidges
 RUN printf "\ngo      ALL=(ALL:ALL) NOPASSWD: /usr/bin/pip, /usr/local/bin/pip\n" >> /etc/sudoers
 RUN printf "\ngo      ALL=(ALL:ALL) NOPASSWD: /usr/bin/pip3, /usr/local/bin/pip3\n" >> /etc/sudoers
@@ -63,14 +72,6 @@ RUN \
   # upgrade setuptools early to avoid no distribution errors
   pip install --upgrade setuptools==39.0.1 && \
   pip3 install --upgrade setuptools==39.0.1
-
-# Compile python 3.6 for Zappa, as zappa requires python 2.7 or 3.6.
-# There is no bionic GOCD official image published to base off of, and there is no official 3.6 python package for ubuntu 14.04 or 16.04
-# This will only be on your path as 'python3.6' it will not change the current 'python3' on your path to python 3.6
-# This isnt a separate agent because deploys of this are likely quite rare.
-# If we update the GOCD agent to use ubuntu > 14 we can just use the python3
-# that is already installed for zappa deployments.
-RUN apt-get update && apt-get install zlib1g-dev wget lsb-core -qy && cd /opt && wget https://www.python.org/ftp/python/3.6.7/Python-3.6.7.tgz && tar -xvf Python-3.6.7.tgz && cd /opt/Python-3.6.7 && ./configure --prefix=/usr && cd /opt/Python-3.6.7 && make && make commoninstall maninstall && rm -rf /opt/Python-3.6.7
 
 # Install AWS command-line interface - for AWS operations in a go-agent task.
 RUN pip install 'awscli>=1.11.58'

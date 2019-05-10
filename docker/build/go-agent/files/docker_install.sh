@@ -1,44 +1,117 @@
 #!/bin/sh
 set -e
-#
+
 # This script is meant for quick & easy install via:
-#   'curl -sSL https://get.docker.com/ | sh'
-# or:
-#   'wget -qO- https://get.docker.com/ | sh'
+#   $ curl -fsSL https://get.docker.com -o get-docker.sh
+#   $ sh get-docker.sh
 #
 # For test builds (ie. release candidates):
-#   'curl -fsSL https://test.docker.com/ | sh'
-# or:
-#   'wget -qO- https://test.docker.com/ | sh'
+#   $ curl -fsSL https://test.docker.com -o test-docker.sh
+#   $ sh test-docker.sh
 #
-# For experimental builds:
-#   'curl -fsSL https://experimental.docker.com/ | sh'
-# or:
-#   'wget -qO- https://experimental.docker.com/ | sh'
+# NOTE: Make sure to verify the contents of the script
+#       you downloaded matches the contents of install.sh
+#       located at https://github.com/docker/docker-install
+#       before executing.
 #
-# Docker Maintainers:
-#   To update this script on https://get.docker.com,
-#   use hack/release.sh during a normal release,
-#   or the following one-liner for script hotfixes:
-#     aws s3 cp --acl public-read hack/install.sh s3://get.docker.com/index
-#
+# Git commit from https://github.com/docker/docker-install when
+# the script was uploaded (Should only be modified by upload job):
+SCRIPT_COMMIT_SHA=2f4ae48
 
-url="https://get.docker.com/"
-apt_url="https://apt.dockerproject.org"
-yum_url="https://yum.dockerproject.org"
-gpg_fingerprint="58118E89F3A912897C070ADBF76221572C52609D"
 
-key_servers="
-ha.pool.sks-keyservers.net
-pgp.mit.edu
-keyserver.ubuntu.com
-"
+# The channel to install from:
+#   * nightly
+#   * test
+#   * stable
+#   * edge (deprecated)
+DEFAULT_CHANNEL_VALUE="stable"
+if [ -z "$CHANNEL" ]; then
+	CHANNEL=$DEFAULT_CHANNEL_VALUE
+fi
+
+DEFAULT_DOWNLOAD_URL="https://download.docker.com"
+if [ -z "$DOWNLOAD_URL" ]; then
+	DOWNLOAD_URL=$DEFAULT_DOWNLOAD_URL
+fi
+
+DEFAULT_REPO_FILE="docker-ce.repo"
+if [ -z "$REPO_FILE" ]; then
+	REPO_FILE="$DEFAULT_REPO_FILE"
+fi
+
+mirror=''
+DRY_RUN=${DRY_RUN:-}
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--mirror)
+			mirror="$2"
+			shift
+			;;
+		--dry-run)
+			DRY_RUN=1
+			;;
+		--*)
+			echo "Illegal option $1"
+			;;
+	esac
+	shift $(( $# > 0 ? 1 : 0 ))
+done
+
+case "$mirror" in
+	Aliyun)
+		DOWNLOAD_URL="https://mirrors.aliyun.com/docker-ce"
+		;;
+	AzureChinaCloud)
+		DOWNLOAD_URL="https://mirror.azure.cn/docker-ce"
+		;;
+esac
 
 command_exists() {
 	command -v "$@" > /dev/null 2>&1
 }
 
+is_dry_run() {
+	if [ -z "$DRY_RUN" ]; then
+		return 1
+	else
+		return 0
+	fi
+}
+
+deprecation_notice() {
+	distro=$1
+	date=$2
+	echo
+	echo "DEPRECATION WARNING:"
+	echo "    The distribution, $distro, will no longer be supported in this script as of $date."
+	echo "    If you feel this is a mistake please submit an issue at https://github.com/docker/docker-install/issues/new"
+	echo
+	sleep 10
+}
+
+get_distribution() {
+	lsb_dist=""
+	# Every system that we officially support has /etc/os-release
+	if [ -r /etc/os-release ]; then
+		lsb_dist="$(. /etc/os-release && echo "$ID")"
+	fi
+	# Returning an empty string here should be alright since the
+	# case statements don't act unless you provide an actual value
+	echo "$lsb_dist"
+}
+
+add_debian_backport_repo() {
+	debian_version="$1"
+	backports="deb http://ftp.debian.org/debian $debian_version-backports main"
+	if ! grep -Fxq "$backports" /etc/apt/sources.list; then
+		(set -x; $sh_c "echo \"$backports\" >> /etc/apt/sources.list")
+	fi
+}
+
 echo_docker_as_nonroot() {
+	if is_dry_run; then
+		return
+	fi
 	if command_exists docker && [ -e /var/run/docker.sock ]; then
 		(
 			set -x
@@ -48,16 +121,19 @@ echo_docker_as_nonroot() {
 	your_user=your-user
 	[ "$user" != 'root' ] && your_user="$user"
 	# intentionally mixed spaces and tabs here -- tabs are stripped by "<<-EOF", spaces are kept in the output
-	cat <<-EOF
+	echo "If you would like to use Docker as a non-root user, you should now consider"
+	echo "adding your user to the \"docker\" group with something like:"
+	echo
+	echo "  sudo usermod -aG docker $your_user"
+	echo
+	echo "Remember that you will have to log out and back in for this to take effect!"
+	echo
+	echo "WARNING: Adding a user to the \"docker\" group will grant the ability to run"
+	echo "         containers which can be used to obtain root privileges on the"
+	echo "         docker host."
+	echo "         Refer to https://docs.docker.com/engine/security/security/#docker-daemon-attack-surface"
+	echo "         for more information."
 
-	If you would like to use Docker as a non-root user, you should now consider
-	adding your user to the "docker" group with something like:
-
-	  sudo usermod -aG docker $your_user
-
-	Remember that you will have to log out and back in for this to take effect!
-
-	EOF
 }
 
 # Check if this is a forked Linux distro
@@ -79,42 +155,34 @@ check_forked() {
 			EOF
 
 			# Get the upstream release info
-			lsb_dist=$(lsb_release -a -u 2>&1 | tr '[:upper:]' '[:lower:]' | grep -E 'id' | cut -d ':' -f 2 | tr -d '[[:space:]]')
-			dist_version=$(lsb_release -a -u 2>&1 | tr '[:upper:]' '[:lower:]' | grep -E 'codename' | cut -d ':' -f 2 | tr -d '[[:space:]]')
+			lsb_dist=$(lsb_release -a -u 2>&1 | tr '[:upper:]' '[:lower:]' | grep -E 'id' | cut -d ':' -f 2 | tr -d '[:space:]')
+			dist_version=$(lsb_release -a -u 2>&1 | tr '[:upper:]' '[:lower:]' | grep -E 'codename' | cut -d ':' -f 2 | tr -d '[:space:]')
 
 			# Print info about upstream distro
 			cat <<-EOF
 			Upstream release is '$lsb_dist' version '$dist_version'.
 			EOF
 		else
-			if [ -r /etc/debian_version ] && [ "$lsb_dist" != "ubuntu" ]; then
-				# We're Debian and don't even know it!
-				lsb_dist=debian
-				dist_version="$(cat /etc/debian_version | sed 's/\/.*//' | sed 's/\..*//')"
+			if [ -r /etc/debian_version ] && [ "$lsb_dist" != "ubuntu" ] && [ "$lsb_dist" != "raspbian" ]; then
+				if [ "$lsb_dist" = "osmc" ]; then
+					# OSMC runs Raspbian
+					lsb_dist=raspbian
+				else
+					# We're Debian and don't even know it!
+					lsb_dist=debian
+				fi
+				dist_version="$(sed 's/\/.*//' /etc/debian_version | sed 's/\..*//')"
 				case "$dist_version" in
+					9)
+						dist_version="stretch"
+					;;
 					8|'Kali Linux 2')
 						dist_version="jessie"
-					;;
-					7)
-						dist_version="wheezy"
 					;;
 				esac
 			fi
 		fi
 	fi
-}
-
-rpm_import_repository_key() {
-	local key=$1; shift
-	local tmpdir=$(mktemp -d)
-	chmod 600 "$tmpdir"
-	for key_server in $key_servers ; do
-		gpg --homedir "$tmpdir" --keyserver "$key_server" --recv-keys "$key" && break
-	done
-	gpg --homedir "$tmpdir" -k "$key" >/dev/null
-	gpg --homedir "$tmpdir" --export --armor "$key" > "$tmpdir"/repo.key
-	rpm --import "$tmpdir"/repo.key
-	rm -rf "$tmpdir"
 }
 
 semverParse() {
@@ -125,32 +193,31 @@ semverParse() {
 	patch="${patch%%[-.]*}"
 }
 
+ee_notice() {
+	echo
+	echo
+	echo "  WARNING: $1 is now only supported by Docker EE"
+	echo "           Check https://store.docker.com for information on Docker EE"
+	echo
+	echo
+}
+
 do_install() {
-	case "$(uname -m)" in
-		*64)
-			;;
-		*)
-			cat >&2 <<-'EOF'
-			Error: you are not using a 64bit platform.
-			Docker currently only supports 64bit platforms.
-			EOF
-			exit 1
-			;;
-	esac
+	echo "# Executing docker install script, commit: $SCRIPT_COMMIT_SHA"
 
 	if command_exists docker; then
-		version="$(docker -v | awk -F '[ ,]+' '{ print $3 }')"
+		docker_version="$(docker -v | cut -d ' ' -f3 | cut -d ',' -f1)"
 		MAJOR_W=1
 		MINOR_W=10
 
-		semverParse $version
+		semverParse "$docker_version"
 
 		shouldWarn=0
-		if [ $major -lt $MAJOR_W ]; then
+		if [ "$major" -lt "$MAJOR_W" ]; then
 			shouldWarn=1
 		fi
 
-		if [ $major -le $MAJOR_W ] && [ $minor -lt $MINOR_W ]; then
+		if [ "$major" -le "$MAJOR_W" ] && [ "$minor" -lt "$MINOR_W" ]; then
 			shouldWarn=1
 		fi
 
@@ -202,52 +269,12 @@ do_install() {
 		fi
 	fi
 
-	curl=''
-	if command_exists curl; then
-		curl='curl -sSL'
-	elif command_exists wget; then
-		curl='wget -qO-'
-	elif command_exists busybox && busybox --list-modules | grep -q wget; then
-		curl='busybox wget -qO-'
-	fi
-
-	# check to see which repo they are trying to install from
-	if [ -z "$repo" ]; then
-		repo='main'
-		if [ "https://test.docker.com/" = "$url" ]; then
-			repo='testing'
-		elif [ "https://experimental.docker.com/" = "$url" ]; then
-			repo='experimental'
-		fi
+	if is_dry_run; then
+		sh_c="echo"
 	fi
 
 	# perform some very rudimentary platform detection
-	lsb_dist=''
-	dist_version=''
-	if command_exists lsb_release; then
-		lsb_dist="$(lsb_release -si)"
-	fi
-	if [ -z "$lsb_dist" ] && [ -r /etc/lsb-release ]; then
-		lsb_dist="$(. /etc/lsb-release && echo "$DISTRIB_ID")"
-	fi
-	if [ -z "$lsb_dist" ] && [ -r /etc/debian_version ]; then
-		lsb_dist='debian'
-	fi
-	if [ -z "$lsb_dist" ] && [ -r /etc/fedora-release ]; then
-		lsb_dist='fedora'
-	fi
-	if [ -z "$lsb_dist" ] && [ -r /etc/oracle-release ]; then
-		lsb_dist='oracleserver'
-	fi
-	if [ -z "$lsb_dist" ]; then
-		if [ -r /etc/centos-release ] || [ -r /etc/redhat-release ]; then
-			lsb_dist='centos'
-		fi
-	fi
-	if [ -z "$lsb_dist" ] && [ -r /etc/os-release ]; then
-		lsb_dist="$(. /etc/os-release && echo "$ID")"
-	fi
-
+	lsb_dist=$( get_distribution )
 	lsb_dist="$(echo "$lsb_dist" | tr '[:upper:]' '[:lower:]')"
 
 	case "$lsb_dist" in
@@ -261,37 +288,37 @@ do_install() {
 			fi
 		;;
 
-		debian)
-			dist_version="$(cat /etc/debian_version | sed 's/\/.*//' | sed 's/\..*//')"
+		debian|raspbian)
+			dist_version="$(sed 's/\/.*//' /etc/debian_version | sed 's/\..*//')"
 			case "$dist_version" in
+				9)
+					dist_version="stretch"
+				;;
 				8)
 					dist_version="jessie"
-				;;
-				7)
-					dist_version="wheezy"
 				;;
 			esac
 		;;
 
-		oracleserver)
-			# need to switch lsb_dist to match yum repo URL
-			lsb_dist="oraclelinux"
-			dist_version="$(rpm -q --whatprovides redhat-release --queryformat "%{VERSION}\n" | sed 's/\/.*//' | sed 's/\..*//' | sed 's/Server*//')"
-		;;
-
-		fedora|centos)
-			dist_version="$(rpm -q --whatprovides redhat-release --queryformat "%{VERSION}\n" | sed 's/\/.*//' | sed 's/\..*//' | sed 's/Server*//')"
-		;;
-
-		*)
-			if command_exists lsb_release; then
-				dist_version="$(lsb_release --codename | cut -f2)"
-			fi
+		centos)
 			if [ -z "$dist_version" ] && [ -r /etc/os-release ]; then
 				dist_version="$(. /etc/os-release && echo "$VERSION_ID")"
 			fi
 		;;
 
+		rhel|ol|sles)
+			ee_notice "$lsb_dist"
+			exit 1
+			;;
+
+		*)
+			if command_exists lsb_release; then
+				dist_version="$(lsb_release --release | cut -f2)"
+			fi
+			if [ -z "$dist_version" ] && [ -r /etc/os-release ]; then
+				dist_version="$(. /etc/os-release && echo "$VERSION_ID")"
+			fi
+		;;
 
 	esac
 
@@ -300,204 +327,141 @@ do_install() {
 
 	# Run setup for each distro accordingly
 	case "$lsb_dist" in
-		amzn)
-			(
-			set -x
-			$sh_c 'sleep 3; yum -y -q install docker'
-			)
-			echo_docker_as_nonroot
-			exit 0
-			;;
-
-		'opensuse project'|opensuse)
-			echo 'Going to perform the following operations:'
-			if [ "$repo" != 'main' ]; then
-				echo '  * add repository obs://Virtualization:containers'
-			fi
-			echo '  * install Docker'
-			$sh_c 'echo "Press CTRL-C to abort"; sleep 3'
-
-			if [ "$repo" != 'main' ]; then
-				# install experimental packages from OBS://Virtualization:containers
-				(
-					set -x
-					zypper -n ar -f obs://Virtualization:containers Virtualization:containers
-					rpm_import_repository_key 55A0B34D49501BB7CA474F5AA193FBB572174FC2
-				)
-			fi
-			(
-				set -x
-				zypper -n install docker
-			)
-			echo_docker_as_nonroot
-			exit 0
-			;;
-		'suse linux'|sle[sd])
-			echo 'Going to perform the following operations:'
-			if [ "$repo" != 'main' ]; then
-				echo '  * add repository obs://Virtualization:containers'
-				echo '  * install experimental Docker using packages NOT supported by SUSE'
-			else
-				echo '  * add the "Containers" module'
-				echo '  * install Docker using packages supported by SUSE'
-			fi
-			$sh_c 'echo "Press CTRL-C to abort"; sleep 3'
-
-			if [ "$repo" != 'main' ]; then
-				# install experimental packages from OBS://Virtualization:containers
-				echo >&2 'Warning: installing experimental packages from OBS, these packages are NOT supported by SUSE'
-				(
-					set -x
-					zypper -n ar -f obs://Virtualization:containers/SLE_12 Virtualization:containers
-					rpm_import_repository_key 55A0B34D49501BB7CA474F5AA193FBB572174FC2
-				)
-			else
-				# Add the containers module
-				# Note well-1: the SLE machine must already be registered against SUSE Customer Center
-				# Note well-2: the `-r ""` is required to workaround a known issue of SUSEConnect
-				(
-					set -x
-					SUSEConnect -p sle-module-containers/12/x86_64 -r ""
-				)
-			fi
-			(
-				set -x
-				zypper -n install docker
-			)
-			echo_docker_as_nonroot
-			exit 0
-			;;
-
-		ubuntu|debian)
-			export DEBIAN_FRONTEND=noninteractive
-
-			did_apt_get_update=
-			apt_get_update() {
-				if [ -z "$did_apt_get_update" ]; then
-					( set -x; $sh_c 'sleep 3; apt-get update' )
-					did_apt_get_update=1
+		ubuntu|debian|raspbian)
+			pre_reqs="apt-transport-https ca-certificates curl"
+			if [ "$lsb_dist" = "debian" ]; then
+				# libseccomp2 does not exist for debian jessie main repos for aarch64
+				if [ "$(uname -m)" = "aarch64" ] && [ "$dist_version" = "jessie" ]; then
+					add_debian_backport_repo "$dist_version"
 				fi
-			}
+			fi
 
-			# aufs is preferred over devicemapper; try to ensure the driver is available.
-			if ! grep -q aufs /proc/filesystems && ! $sh_c 'modprobe aufs'; then
-				if uname -r | grep -q -- '-generic' && dpkg -l 'linux-image-*-generic' | grep -qE '^ii|^hi' 2>/dev/null; then
-					kern_extras="linux-image-extra-$(uname -r) linux-image-extra-virtual"
-
-					apt_get_update
-					( set -x; $sh_c 'sleep 3; apt-get install -y -q '"$kern_extras" ) || true
-
-					if ! grep -q aufs /proc/filesystems && ! $sh_c 'modprobe aufs'; then
-						echo >&2 'Warning: tried to install '"$kern_extras"' (for AUFS)'
-						echo >&2 ' but we still have no AUFS.  Docker may not work. Proceeding anyways!'
-						( set -x; sleep 10 )
+			if ! command -v gpg > /dev/null; then
+				pre_reqs="$pre_reqs gnupg"
+			fi
+			apt_repo="deb [arch=$(dpkg --print-architecture)] $DOWNLOAD_URL/linux/$lsb_dist $dist_version $CHANNEL"
+			(
+				if ! is_dry_run; then
+					set -x
+				fi
+				$sh_c 'apt-get update -qq >/dev/null'
+				$sh_c "apt-get install -y -qq $pre_reqs >/dev/null"
+				$sh_c "curl -fsSL \"$DOWNLOAD_URL/linux/$lsb_dist/gpg\" | apt-key add -qq - >/dev/null"
+				$sh_c "echo \"$apt_repo\" > /etc/apt/sources.list.d/docker.list"
+				$sh_c 'apt-get update -qq >/dev/null'
+			)
+			pkg_version=""
+			if [ -n "$VERSION" ]; then
+				if is_dry_run; then
+					echo "# WARNING: VERSION pinning is not supported in DRY_RUN"
+				else
+					# Will work for incomplete versions IE (17.12), but may not actually grab the "latest" if in the test channel
+					pkg_pattern="$(echo "$VERSION" | sed "s/-ce-/~ce~.*/g" | sed "s/-/.*/g").*-0~$lsb_dist"
+					search_command="apt-cache madison 'docker-ce' | grep '$pkg_pattern' | head -1 | awk '{\$1=\$1};1' | cut -d' ' -f 3"
+					pkg_version="$($sh_c "$search_command")"
+					echo "INFO: Searching repository for VERSION '$VERSION'"
+					echo "INFO: $search_command"
+					if [ -z "$pkg_version" ]; then
+						echo
+						echo "ERROR: '$VERSION' not found amongst apt-cache madison results"
+						echo
+						exit 1
 					fi
-				else
-					echo >&2 'Warning: current kernel is not supported by the linux-image-extra-virtual'
-					echo >&2 ' package.  We have no AUFS support.  Consider installing the packages'
-					echo >&2 ' linux-image-virtual kernel and linux-image-extra-virtual for AUFS support.'
-					( set -x; sleep 10 )
+					search_command="apt-cache madison 'docker-ce-cli' | grep '$pkg_pattern' | head -1 | awk '{\$1=\$1};1' | cut -d' ' -f 3"
+					# Don't insert an = for cli_pkg_version, we'll just include it later
+					cli_pkg_version="$($sh_c "$search_command")"
+					pkg_version="=$pkg_version"
 				fi
-			fi
-
-			# install apparmor utils if they're missing and apparmor is enabled in the kernel
-			# otherwise Docker will fail to start
-			if [ "$(cat /sys/module/apparmor/parameters/enabled 2>/dev/null)" = 'Y' ]; then
-				if command -v apparmor_parser >/dev/null 2>&1; then
-					echo 'apparmor is enabled in the kernel and apparmor utils were already installed'
-				else
-					echo 'apparmor is enabled in the kernel, but apparmor_parser missing'
-					apt_get_update
-					( set -x; $sh_c 'sleep 3; apt-get install -y -q apparmor' )
-				fi
-			fi
-
-			if [ ! -e /usr/lib/apt/methods/https ]; then
-				apt_get_update
-				( set -x; $sh_c 'sleep 3; apt-get install -y -q apt-transport-https ca-certificates' )
-			fi
-			if [ -z "$curl" ]; then
-				apt_get_update
-				( set -x; $sh_c 'sleep 3; apt-get install -y -q curl ca-certificates' )
-				curl='curl -sSL'
 			fi
 			(
-			set -x
-			for key_server in $key_servers ; do
-				$sh_c "apt-key adv --keyserver hkp://${key_server}:80 --recv-keys ${gpg_fingerprint}" && break
-			done
-			$sh_c "apt-key adv -k ${gpg_fingerprint} >/dev/null"
-			$sh_c "mkdir -p /etc/apt/sources.list.d"
-			$sh_c "echo deb [arch=$(dpkg --print-architecture)] ${apt_url}/repo ${lsb_dist}-${dist_version} ${repo} > /etc/apt/sources.list.d/docker.list"
-			$sh_c 'sleep 3; apt-get update; apt-get install -y -q docker-engine'
+				if ! is_dry_run; then
+					set -x
+				fi
+				if [ -n "$cli_pkg_version" ]; then
+					$sh_c "apt-get install -y -qq --no-install-recommends docker-ce-cli=$cli_pkg_version >/dev/null"
+				fi
+				$sh_c "apt-get install -y -qq --no-install-recommends docker-ce$pkg_version >/dev/null"
 			)
 			echo_docker_as_nonroot
 			exit 0
 			;;
-
-		fedora|centos|oraclelinux)
-			$sh_c "cat >/etc/yum.repos.d/docker-${repo}.repo" <<-EOF
-			[docker-${repo}-repo]
-			name=Docker ${repo} Repository
-			baseurl=${yum_url}/repo/${repo}/${lsb_dist}/${dist_version}
-			enabled=1
-			gpgcheck=1
-			gpgkey=${yum_url}/gpg
-			EOF
-			if [ "$lsb_dist" = "fedora" ] && [ "$dist_version" -ge "22" ]; then
-				(
-					set -x
-					$sh_c 'sleep 3; dnf -y -q install docker-engine'
-				)
-			else
-				(
-					set -x
-					$sh_c 'sleep 3; yum -y -q install docker-engine'
-				)
-			fi
-			echo_docker_as_nonroot
-			exit 0
-			;;
-		gentoo)
-			if [ "$url" = "https://test.docker.com/" ]; then
-				# intentionally mixed spaces and tabs here -- tabs are stripped by "<<-'EOF'", spaces are kept in the output
-				cat >&2 <<-'EOF'
-
-				  You appear to be trying to install the latest nightly build in Gentoo.'
-				  The portage tree should contain the latest stable release of Docker, but'
-				  if you want something more recent, you can always use the live ebuild'
-				  provided in the "docker" overlay available via layman.  For more'
-				  instructions, please see the following URL:'
-
-				    https://github.com/tianon/docker-overlay#using-this-overlay'
-
-				  After adding the "docker" overlay, you should be able to:'
-
-				    emerge -av =app-emulation/docker-9999'
-
-				EOF
+		centos|fedora)
+			yum_repo="$DOWNLOAD_URL/linux/$lsb_dist/$REPO_FILE"
+			if ! curl -Ifs "$yum_repo" > /dev/null; then
+				echo "Error: Unable to curl repository file $yum_repo, is it valid?"
 				exit 1
 			fi
-
+			if [ "$lsb_dist" = "fedora" ]; then
+				pkg_manager="dnf"
+				config_manager="dnf config-manager"
+				enable_channel_flag="--set-enabled"
+				disable_channel_flag="--set-disabled"
+				pre_reqs="dnf-plugins-core"
+				pkg_suffix="fc$dist_version"
+			else
+				pkg_manager="yum"
+				config_manager="yum-config-manager"
+				enable_channel_flag="--enable"
+				disable_channel_flag="--disable"
+				pre_reqs="yum-utils"
+				pkg_suffix="el"
+			fi
 			(
-				set -x
-				$sh_c 'sleep 3; emerge app-emulation/docker'
+				if ! is_dry_run; then
+					set -x
+				fi
+				$sh_c "$pkg_manager install -y -q $pre_reqs"
+				$sh_c "$config_manager --add-repo $yum_repo"
+
+				if [ "$CHANNEL" != "stable" ]; then
+					$sh_c "$config_manager $disable_channel_flag docker-ce-*"
+					$sh_c "$config_manager $enable_channel_flag docker-ce-$CHANNEL"
+				fi
+				$sh_c "$pkg_manager makecache"
 			)
+			pkg_version=""
+			if [ -n "$VERSION" ]; then
+				if is_dry_run; then
+					echo "# WARNING: VERSION pinning is not supported in DRY_RUN"
+				else
+					pkg_pattern="$(echo "$VERSION" | sed "s/-ce-/\\\\.ce.*/g" | sed "s/-/.*/g").*$pkg_suffix"
+					search_command="$pkg_manager list --showduplicates 'docker-ce' | grep '$pkg_pattern' | tail -1 | awk '{print \$2}'"
+					pkg_version="$($sh_c "$search_command")"
+					echo "INFO: Searching repository for VERSION '$VERSION'"
+					echo "INFO: $search_command"
+					if [ -z "$pkg_version" ]; then
+						echo
+						echo "ERROR: '$VERSION' not found amongst $pkg_manager list results"
+						echo
+						exit 1
+					fi
+					search_command="$pkg_manager list --showduplicates 'docker-ce-cli' | grep '$pkg_pattern' | tail -1 | awk '{print \$2}'"
+					# It's okay for cli_pkg_version to be blank, since older versions don't support a cli package
+					cli_pkg_version="$($sh_c "$search_command" | cut -d':' -f 2)"
+					# Cut out the epoch and prefix with a '-'
+					pkg_version="-$(echo "$pkg_version" | cut -d':' -f 2)"
+				fi
+			fi
+			(
+				if ! is_dry_run; then
+					set -x
+				fi
+				# install the correct cli version first
+				if [ -n "$cli_pkg_version" ]; then
+					$sh_c "$pkg_manager install -y -q docker-ce-cli-$cli_pkg_version"
+				fi
+				$sh_c "$pkg_manager install -y -q docker-ce$pkg_version"
+			)
+			echo_docker_as_nonroot
 			exit 0
 			;;
+		*)
+			echo
+			echo "ERROR: Unsupported distribution '$lsb_dist'"
+			echo
+			exit 1
+			;;
 	esac
-
-	# intentionally mixed spaces and tabs here -- tabs are stripped by "<<-'EOF'", spaces are kept in the output
-	cat >&2 <<-'EOF'
-
-	  Either your platform is not easily detectable, is not supported by this
-	  installer script (yet - PRs welcome! [hack/install.sh]), or does not yet have
-	  a package for Docker.  Please visit the following URL for more detailed
-	  installation instructions:
-
-	    https://docs.docker.com/engine/installation/
-
-	EOF
 	exit 1
 }
 
