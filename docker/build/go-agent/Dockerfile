@@ -48,16 +48,20 @@ RUN apt-get update && apt-get install -y -q \
 # Install dependencies needed for Ansible 2.x
 RUN apt-get update && apt-get install -y libffi-dev libssl-dev
 
+# Install sudo to execute commands with root privileges
+RUN apt-get install -y sudo
+
+# Add Docker's GPG key and repository
+RUN curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add - && \
+    add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu \
+    $(lsb_release -cs) stable"
+
 # Install Docker - for Docker container building by a go-agent.
-COPY docker/build/go-agent/files/docker_install.sh /tmp/docker/
-RUN /bin/bash /tmp/docker/docker_install.sh
+RUN apt-get update && apt-get install -y docker-ce
 
 # Add the go user to the docker group to allow the go user to run docker commands.
 # See: https://docs.docker.com/engine/installation/linux/ubuntulinux/
 RUN usermod -aG docker go
-
-# Install sudo to execute commands with root privileges
-RUN apt-get install -y sudo
 
 # Assign the go user root privlidges
 RUN printf "\ngo      ALL=(ALL:ALL) NOPASSWD: /usr/bin/pip, /usr/local/bin/pip\n" >> /etc/sudoers
